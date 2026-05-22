@@ -21,7 +21,7 @@ fn main() {
             // lexical & syntactic analysis
             let source = std::fs::read(&path).unwrap();
             let tree = parser.parse(&source, None).unwrap();
-            let expr = Expression::from((tree.root_node(), &source[..]));
+            let expr = Expression::from((&mut tree.walk(), &source[..]));
             println!("{:#?}", expr)
 
             // semantic analysis
@@ -69,54 +69,87 @@ pub enum Expression {
     Record(Vec<(String, Expression)>),
 }
 
-impl From<(tree_sitter::Node<'_>, &[u8])> for Expression {
-    fn from((node, source): (tree_sitter::Node, &[u8])) -> Self {
-        match node.kind() {
-            "abstraction" => Self::Abstraction {
-                parameter: node
-                    .child_by_field_name("parameter")
-                    .unwrap()
-                    .utf8_text(source)
-                    .unwrap()
-                    .into(),
-                body: Box::new((node.child_by_field_name("body").unwrap(), source).into()),
-            },
-            "application" => Self::Application {
-                function: Box::new((node.child_by_field_name("function").unwrap(), source).into()),
-                argument: Box::new((node.child_by_field_name("argument").unwrap(), source).into()),
-            },
-            "reference" => {
-                let properties = node
-                    .children_by_field_name("property", &mut node.walk())
-                    .map(|property| property.utf8_text(source).unwrap().into())
-                    .collect();
+impl From<(&mut tree_sitter::TreeCursor<'_>, &[u8])> for Expression {
+    fn from((cursor, source): (&mut tree_sitter::TreeCursor<'_>, &[u8])) -> Self {
+        match cursor.node().kind() {
+            "abstraction" => {
+                cursor.goto_first_child(); // \
+                cursor.goto_next_sibling(); // parameter
+                let parameter = cursor.node().utf8_text(source).unwrap().into();
+                cursor.goto_next_sibling(); // body
+                let body = Self::from((&mut *cursor, source));
+                cursor.goto_parent();
 
-                if let Some(parameter) = node.child_by_field_name("parameter") {
+                Self::Abstraction {
+                    parameter: parameter,
+                    body: Box::new(body),
+                }
+            }
+            "application" => {
+                cursor.goto_first_child(); // function
+                let function = Self::from((&mut *cursor, source));
+                cursor.goto_next_sibling(); // argument
+                let argument = Self::from((&mut *cursor, source));
+                cursor.goto_parent();
+
+                Self::Application {
+                    function: Box::new(function),
+                    argument: Box::new(argument),
+                }
+            }
+            "reference" => {
+                cursor.goto_first_child(); // . or parameter
+                let parameter = if source[cursor.node().start_byte()] != b'.' {
+                    Some(cursor.node().utf8_text(source).unwrap().into())
+                } else {
+                    None
+                };
+
+                let mut properties = Vec::new();
+                loop {
+                    // .
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                    cursor.goto_next_sibling(); // property
+                    properties.push(cursor.node().utf8_text(source).unwrap().into());
+                }
+                cursor.goto_parent();
+
+                if let Some(parameter) = parameter {
                     Self::Reference {
-                        parameter: parameter.utf8_text(source).unwrap().into(),
+                        parameter,
                         properties,
                     }
                 } else {
                     Self::ReferenceRoot { properties }
                 }
             }
-            "number" => Self::Number(node.utf8_text(source).unwrap().parse().unwrap()),
-            "string" => Self::String(node.utf8_text(source).unwrap().into()),
-            "record" | "root" => Self::Record(
-                node.named_children(&mut node.walk())
-                    .map(|child| {
-                        (
-                            child
-                                .child_by_field_name("field")
-                                .unwrap()
-                                .utf8_text(source)
-                                .unwrap()
-                                .into(),
-                            (child.child_by_field_name("value").unwrap(), source).into(),
-                        )
-                    })
-                    .collect(),
-            ),
+            "number" => Self::Number(cursor.node().utf8_text(source).unwrap().parse().unwrap()),
+            "string" => Self::String(cursor.node().utf8_text(source).unwrap().into()),
+            "record" | "root" => {
+                let mut fields = Vec::new();
+
+                cursor.goto_first_child(); // record_entry
+                loop {
+                    cursor.goto_first_child(); // field
+                    let field = cursor.node().utf8_text(source).unwrap().into();
+                    cursor.goto_next_sibling(); // :
+                    cursor.goto_next_sibling(); // value
+                    let value = Self::from((&mut *cursor, source));
+                    cursor.goto_parent();
+
+                    fields.push((field, value));
+
+                    // record_entry
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+                cursor.goto_parent();
+
+                Self::Record(fields)
+            }
             _ => unreachable!(),
         }
     }
