@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use clap::Parser;
 use lsp_server::*;
 use lsp_types::*;
-use tree_sitter::Node;
 
 #[derive(clap::Parser)]
 enum Command {
@@ -20,9 +19,9 @@ fn main() {
                 .unwrap();
 
             // lexical & syntactic analysis
-            let text = std::fs::read(path).unwrap();
-            let tree = parser.parse(&text, None).unwrap();
-            let expr = Expr::from((tree.root_node().child(0).unwrap(), &text[..]));
+            let source = std::fs::read(&path).unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let expr = Expression::from((tree.root_node(), &source[..]));
             println!("{:#?}", expr)
 
             // semantic analysis
@@ -49,87 +48,76 @@ fn main() {
 }
 
 #[derive(Debug)]
-pub enum Expr {
+pub enum Expression {
     Abstraction {
         parameter: String,
-        body: Box<Expr>,
+        body: Box<Expression>,
     },
     Application {
-        function: Box<Expr>,
-        argument: Box<Expr>,
+        function: Box<Expression>,
+        argument: Box<Expression>,
     },
     Reference {
-        variable: String,
+        parameter: String,
+        properties: Vec<String>,
+    },
+    ReferenceRoot {
         properties: Vec<String>,
     },
     Number(f64),
     String(String),
-    Record(Vec<(String, Expr)>),
+    Record(Vec<(String, Expression)>),
 }
 
-impl From<(Node<'_>, &[u8])> for Expr {
-    fn from(value: (Node<'_>, &[u8])) -> Self {
-        match value.0.kind() {
+impl From<(tree_sitter::Node<'_>, &[u8])> for Expression {
+    fn from((node, source): (tree_sitter::Node, &[u8])) -> Self {
+        match node.kind() {
             "abstraction" => Self::Abstraction {
-                parameter: value
-                    .0
+                parameter: node
                     .child_by_field_name("parameter")
                     .unwrap()
-                    .utf8_text(value.1)
+                    .utf8_text(source)
                     .unwrap()
                     .into(),
-                body: Box::new((value.0.child_by_field_name("body").unwrap(), value.1).into()),
+                body: Box::new((node.child_by_field_name("body").unwrap(), source).into()),
             },
             "application" => Self::Application {
-                function: Box::new(
-                    (value.0.child_by_field_name("function").unwrap(), value.1).into(),
-                ),
-                argument: Box::new(
-                    (value.0.child_by_field_name("argument").unwrap(), value.1).into(),
-                ),
+                function: Box::new((node.child_by_field_name("function").unwrap(), source).into()),
+                argument: Box::new((node.child_by_field_name("argument").unwrap(), source).into()),
             },
             "reference" => {
-                let mut properties = Vec::new();
-                {
-                    let mut cursor = value.0.walk();
-                    for child in value.0.children_by_field_name("property", &mut cursor) {
-                        properties.push(child.utf8_text(value.1).unwrap().into());
-                    }
-                }
+                let properties = node
+                    .children_by_field_name("property", &mut node.walk())
+                    .map(|property| property.utf8_text(source).unwrap().into())
+                    .collect();
 
-                Expr::Reference {
-                    variable: value
-                        .0
-                        .child_by_field_name("variable")
-                        .map_or(String::new(), |variable| {
-                            variable.utf8_text(value.1).unwrap().into()
-                        }),
-                    properties,
+                if let Some(parameter) = node.child_by_field_name("parameter") {
+                    Self::Reference {
+                        parameter: parameter.utf8_text(source).unwrap().into(),
+                        properties,
+                    }
+                } else {
+                    Self::ReferenceRoot { properties }
                 }
             }
-            "number" => Self::Number(value.0.utf8_text(value.1).unwrap().parse().unwrap()),
-            "string" => Self::String(value.0.utf8_text(value.1).unwrap().into()),
-            "record" => {
-                let mut cursor = value.0.walk();
-                Expr::Record(
-                    value
-                        .0
-                        .named_children(&mut cursor)
-                        .map(|child| {
-                            (
-                                child
-                                    .child_by_field_name("field")
-                                    .unwrap()
-                                    .utf8_text(value.1)
-                                    .unwrap()
-                                    .into(),
-                                (child.child_by_field_name("value").unwrap(), value.1).into(),
-                            )
-                        })
-                        .collect(),
-                )
-            }
-            _ => todo!(),
+            "number" => Self::Number(node.utf8_text(source).unwrap().parse().unwrap()),
+            "string" => Self::String(node.utf8_text(source).unwrap().into()),
+            "record" | "root" => Self::Record(
+                node.named_children(&mut node.walk())
+                    .map(|child| {
+                        (
+                            child
+                                .child_by_field_name("field")
+                                .unwrap()
+                                .utf8_text(source)
+                                .unwrap()
+                                .into(),
+                            (child.child_by_field_name("value").unwrap(), source).into(),
+                        )
+                    })
+                    .collect(),
+            ),
+            _ => unreachable!(),
         }
     }
 }
